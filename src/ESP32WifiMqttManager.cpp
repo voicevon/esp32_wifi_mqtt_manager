@@ -226,8 +226,14 @@ void ESP32WifiMqttManager::checkMQTT() {
             updateState(STATE_MQTT_CONNECTING);
             Serial.println("[NetManager MQTT] Launching asynchronous MQTT connect task...");
             
-            // 启动后台异步连接任务
-            xTaskCreate(asyncMqttConnectTask, "mqtt_async_conn", 8192, this, 1, NULL);
+            // 启动后台异步连接任务，并捕获结果
+            BaseType_t ret = xTaskCreate(asyncMqttConnectTask, "mqtt_async_conn", 8192, this, 1, NULL);
+            if (ret == pdPASS) {
+                _isConnecting = true; // 任务创建成功，立即加锁
+            } else {
+                Serial.println("[NetManager MQTT] Error: Failed to create MQTT task!");
+                updateState(STATE_WIFI_CONNECTED); // 创建失败，直接回退状态
+            }
         }
     }
 }
