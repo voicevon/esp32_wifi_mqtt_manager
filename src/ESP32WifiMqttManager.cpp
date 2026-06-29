@@ -4,6 +4,58 @@
 // 初始化静态实例指针
 ESP32WifiMqttManager* ESP32WifiMqttManager::_instance = nullptr;
 
+// FreeRTOS 后台异步解析与连接任务
+void asyncMqttConnectTask(void* pvParameters) {
+    ESP32WifiMqttManager* mgr = (ESP32WifiMqttManager*)pvParameters;
+    if (!mgr) {
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    mgr->_isConnecting = true;
+    
+    uint32_t now = millis();
+    // 如果尚未解析成功过，或者解析缓存已超过 5 分钟，则进行 DNS 域名解析
+    if (mgr->_resolvedBrokerIp[0] == 0 || (now - mgr->_lastDnsResolveMs > 300000)) {
+        mgr->_lastDnsResolveMs = now;
+        IPAddress tempIP = mgr->resolveBrokerIp(mgr->_config.mqttBroker);
+        if (tempIP[0] != 0) {
+            mgr->_resolvedBrokerIp = tempIP;
+            Serial.printf("[NetManager MQTT Task] DNS resolved IP: %s\n", tempIP.toString().c_str());
+        } else {
+            Serial.println("[NetManager MQTT Task] DNS resolution failed, will fallback to domain.");
+        }
+    }
+
+    // 根据解析出的 IP 分配服务器
+    if (mgr->_resolvedBrokerIp[0] != 0) {
+        mgr->_mqttClient.setServer(mgr->_resolvedBrokerIp, mgr->_config.mqttPort);
+    } else {
+        mgr->_mqttClient.setServer(mgr->_config.mqttBroker, mgr->_config.mqttPort);
+    }
+
+    // 构建 Client ID 
+    String clientId = String(mgr->_config.clientIdPrefix) + "-" + String(random(0xffff), HEX);
+
+    // 尝试连接 MQTT Broker (阻塞操作)
+    Serial.println("[NetManager MQTT Task] Attempting connection to Broker...");
+    bool success;
+    if (mgr->_config.mqttUsername != nullptr && mgr->_config.mqttPassword != nullptr) {
+        success = mgr->_mqttClient.connect(clientId.c_str(), mgr->_config.mqttUsername, mgr->_config.mqttPassword);
+    } else {
+        success = mgr->_mqttClient.connect(clientId.c_str());
+    }
+
+    if (success) {
+        Serial.println("[NetManager MQTT Task] Connected successfully.");
+    } else {
+        Serial.printf("[NetManager MQTT Task] Connection failed, rc=%d\n", mgr->_mqttClient.state());
+    }
+
+    mgr->_isConnecting = false;
+    vTaskDelete(NULL); // 连接任务完成，自我销毁
+}
+
 ESP32WifiMqttManager::ESP32WifiMqttManager(Client& netClient) 
     : _netClient(netClient), _mqttClient(netClient) {
     _instance = this;
@@ -36,17 +88,29 @@ void ESP32WifiMqttManager::loop() {
             updateState(STATE_WIFI_CONNECTED);
         }
 
-        // 2. 只有 WiFi 正常连通，才维护 MQTT 连接
-        checkMQTT();
+        // 2. 仅在非连接过程中，维护 MQTT 探测
+        if (!_isConnecting) {
+            checkMQTT();
+        }
 
-        // 3. 若 MQTT 连通，驱动其心跳循环
+        // 3. 在主线程检测并同步更新状态与心跳
         if (_mqttClient.connected()) {
+            if (_state != STATE_MQTT_CONNECTED) {
+                updateState(STATE_MQTT_CONNECTED);
+            }
             _mqttClient.loop();
+        } else {
+            // 如果连接已断开，且我们当前没有正在连接：
+            if (!_isConnecting) {
+                if (_state == STATE_MQTT_CONNECTED || _state == STATE_MQTT_CONNECTING) {
+                    updateState(STATE_WIFI_CONNECTED);
+                }
+            }
         }
     } else {
         // WiFi 未连接：若此前 MQTT 是连通的，主动断开并清理状态
         if (_state == STATE_MQTT_CONNECTED || _state == STATE_MQTT_CONNECTING || _state == STATE_WIFI_CONNECTED) {
-            if (_mqttClient.connected()) {
+            if (!_isConnecting && _mqttClient.connected()) {
                 _mqttClient.disconnect();
             }
             updateState(STATE_DISCONNECTED);
@@ -63,6 +127,7 @@ bool ESP32WifiMqttManager::isWifiConnected() {
 }
 
 bool ESP32WifiMqttManager::isMqttConnected() {
+    if (_isConnecting) return false;
     return _mqttClient.connected();
 }
 
@@ -79,6 +144,7 @@ void ESP32WifiMqttManager::setMqttCallback(MqttMessageCallback cb) {
 }
 
 bool ESP32WifiMqttManager::subscribe(const char* topic, uint8_t qos) {
+    if (_isConnecting) return false;
     if (_mqttClient.connected()) {
         return _mqttClient.subscribe(topic, qos);
     }
@@ -86,6 +152,7 @@ bool ESP32WifiMqttManager::subscribe(const char* topic, uint8_t qos) {
 }
 
 bool ESP32WifiMqttManager::publish(const char* topic, const char* payload) {
+    if (_isConnecting) return false;
     if (_mqttClient.connected()) {
         return _mqttClient.publish(topic, payload);
     }
@@ -93,6 +160,7 @@ bool ESP32WifiMqttManager::publish(const char* topic, const char* payload) {
 }
 
 bool ESP32WifiMqttManager::publish(const char* topic, const uint8_t* payload, unsigned int plength, bool retained) {
+    if (_isConnecting) return false;
     if (_mqttClient.connected()) {
         return _mqttClient.publish(topic, payload, plength, retained);
     }
@@ -100,6 +168,7 @@ bool ESP32WifiMqttManager::publish(const char* topic, const uint8_t* payload, un
 }
 
 bool ESP32WifiMqttManager::beginPublish(const char* topic, size_t totalLength, bool retained) {
+    if (_isConnecting) return false;
     if (_mqttClient.connected()) {
         return _mqttClient.beginPublish(topic, totalLength, retained);
     }
@@ -107,6 +176,7 @@ bool ESP32WifiMqttManager::beginPublish(const char* topic, size_t totalLength, b
 }
 
 size_t ESP32WifiMqttManager::write(const uint8_t* buffer, size_t size) {
+    if (_isConnecting) return 0;
     if (_mqttClient.connected()) {
         return _mqttClient.write(buffer, size);
     }
@@ -114,6 +184,7 @@ size_t ESP32WifiMqttManager::write(const uint8_t* buffer, size_t size) {
 }
 
 bool ESP32WifiMqttManager::endPublish() {
+    if (_isConnecting) return false;
     if (_mqttClient.connected()) {
         return _mqttClient.endPublish();
     }
@@ -147,36 +218,16 @@ void ESP32WifiMqttManager::checkMQTT() {
         uint32_t now = millis();
         if (now - _lastMqttCheck >= _config.mqttReconnectIntervalMs) {
             _lastMqttCheck = now;
-            updateState(STATE_MQTT_CONNECTING);
-
-            Serial.printf("[NetManager MQTT] Attempting connection to Broker: %s:%d ...\n", _config.mqttBroker, _config.mqttPort);
             
-            // 解析 Broker 的 IP 地址
-            _resolvedBrokerIp = resolveBrokerIp(_config.mqttBroker);
-            if (_resolvedBrokerIp[0] != 0) {
-                _mqttClient.setServer(_resolvedBrokerIp, _config.mqttPort);
-            } else {
-                _mqttClient.setServer(_config.mqttBroker, _config.mqttPort);
+            if (_isConnecting) {
+                return; // 已经在连接中，不重复触发
             }
-
-            // 构造随机 ClientID
-            String clientId = String(_config.clientIdPrefix) + "-" + String(random(0xffff), HEX);
-
-            // 尝试连接
-            bool success;
-            if (_config.mqttUsername != nullptr && _config.mqttPassword != nullptr) {
-                success = _mqttClient.connect(clientId.c_str(), _config.mqttUsername, _config.mqttPassword);
-            } else {
-                success = _mqttClient.connect(clientId.c_str());
-            }
-
-            if (success) {
-                Serial.println("[NetManager MQTT] Connected successfully.");
-                updateState(STATE_MQTT_CONNECTED);
-            } else {
-                Serial.printf("[NetManager MQTT] Connection failed, rc=%d\n", _mqttClient.state());
-                updateState(STATE_WIFI_CONNECTED); // 回退到已连接WiFi状态
-            }
+            
+            updateState(STATE_MQTT_CONNECTING);
+            Serial.println("[NetManager MQTT] Launching asynchronous MQTT connect task...");
+            
+            // 启动后台异步连接任务
+            xTaskCreate(asyncMqttConnectTask, "mqtt_async_conn", 8192, this, 1, NULL);
         }
     }
 }

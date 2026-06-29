@@ -5,6 +5,7 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <functional>
+#include <atomic>
 
 enum NetworkState {
     STATE_DISCONNECTED,      // 完全断开（初始状态或网络彻底丢失）
@@ -80,12 +81,16 @@ private:
     uint32_t _lastWifiCheck = 0;
     uint32_t _lastMqttCheck = 0;
     IPAddress _resolvedBrokerIp;
+    uint32_t _lastDnsResolveMs = 0;
+    std::atomic<bool> _isConnecting{false};
 
     void updateState(NetworkState newState);
     void checkWiFi();
     void checkMQTT();
     IPAddress resolveBrokerIp(const char* host);
     static void staticMqttCallback(char* topic, byte* payload, unsigned int length);
+
+    friend void asyncMqttConnectTask(void* pvParameters);
 };
 
 #endif // ESP32_WIFI_MQTT_MANAGER_H
