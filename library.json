@@ -1,0 +1,15 @@
+{
+  "name": "ESP32WifiMqttManager",
+  "version": "1.0.0",
+  "description": "Unified non-blocking WiFi and MQTT connection manager for ESP32 with HTTP-DNS bypass.",
+  "keywords": "wifi, mqtt, esp32, httpdns, reconnect",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/voicevon/esp32_wifi_mqtt_manager.git"
+  },
+  "dependencies": {
+    "knolleary/PubSubClient": "^2.8"
+  },
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
